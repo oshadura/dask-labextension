@@ -146,7 +146,7 @@ export class DaskClusterManager extends Widget {
         await this._updateClusterList();
       },
       frequency: { interval: REFRESH_INTERVAL, backoff: true, max: 60 * 1000 },
-      standby: 'when-hidden'
+      standby: options.refreshStandby || 'when-hidden'
     });
   }
 
@@ -614,6 +614,11 @@ export namespace DaskClusterManager {
      * A callback to get client code for a cluster.
      */
     getClientCodeForCluster: (model: IClusterModel) => string;
+
+    /**
+     * When the model stops polling the API. Defaults to `when-hidden`.
+     */
+    refreshStandby?: Poll.Standby | (() => boolean | Poll.Standby);
   }
 }
 

@@ -1,4 +1,5 @@
 import { Widget, PanelLayout } from '@lumino/widgets';
+import { Poll } from '@lumino/polling';
 import { CommandRegistry } from '@lumino/commands';
 
 import { DaskDashboardLauncher, IDashboardItem } from './dashboard';
@@ -98,5 +99,10 @@ export namespace DaskSidebar {
      * A function that gets client-connection code for a given cluster.
      */
     clientCodeGetter: (model: IClusterModel) => string;
+
+    /**
+     * When the model stops polling the API. Defaults to `when-hidden`.
+     */
+    refreshStandby?: Poll.Standby | (() => boolean | Poll.Standby);
   }
 }

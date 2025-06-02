@@ -2,7 +2,8 @@ import {
   ILabShell,
   ILayoutRestorer,
   JupyterFrontEnd,
-  JupyterFrontEndPlugin
+  JupyterFrontEndPlugin,
+  JupyterLab
 } from '@jupyterlab/application';
 
 import {
@@ -120,6 +121,7 @@ const plugin: JupyterFrontEndPlugin<void> = {
     ISettingRegistry,
     IStateDB
   ],
+  optional: [JupyterLab.IInfo],
   autoStart: true
 };
 
@@ -140,7 +142,8 @@ async function activate(
   mainMenu: IMainMenu,
   notebookTracker: INotebookTracker,
   settingRegistry: ISettingRegistry,
-  state: IStateDB
+  state: IStateDB,
+  info: JupyterLab.IInfo | null
 ): Promise<void> {
   const id = 'dask-dashboard-launcher';
 
@@ -183,7 +186,13 @@ async function activate(
     clientCodeInjector,
     clientCodeGetter: Private.getClientCode,
     registry: app.commands,
-    launchClusterId: CommandIDs.launchCluster
+    launchClusterId: CommandIDs.launchCluster,
+    refreshStandby: () => {
+      if (info) {
+        return !info.isConnected || 'when-hidden';
+      }
+      return 'when-hidden';
+    }
   });
   sidebar.id = id;
   sidebar.title.icon = DaskIcon;
