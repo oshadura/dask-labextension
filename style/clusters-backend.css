@@ -1,0 +1,165 @@
+/* style/clusters-backend.css
+ *
+ * Styles for the Dask Gateway multi-backend UI.
+ * Import from the main style/index.css of the extension.
+ */
+
+/* ── Backend selection dialog ─────────────────────────────────────────────── */
+
+.dask-BackendDialog {
+  min-width: 280px;
+  padding: 8px 0;
+}
+
+.dask-BackendDialog-label {
+  font-weight: 600;
+  margin-bottom: 10px;
+  color: var(--jp-ui-font-color1);
+}
+
+.dask-BackendDialog-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dask-BackendDialog-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background 0.1s;
+}
+
+.dask-BackendDialog-option:hover {
+  background: var(--jp-layout-color2);
+}
+
+.dask-BackendDialog-option--selected {
+  border-color: var(--jp-brand-color1);
+  background: var(--jp-brand-color3, #e8f0fe);
+}
+
+.dask-BackendDialog-option input[type='radio'] {
+  accent-color: var(--jp-brand-color1);
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.dask-BackendDialog-optionName {
+  font-size: var(--jp-ui-font-size1);
+  color: var(--jp-ui-font-color1);
+}
+
+/* ── Cluster row ──────────────────────────────────────────────────────────── */
+
+.dask-ClusterRow-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.dask-ClusterRow-name {
+  font-weight: 600;
+}
+
+/* Backend badge — base style */
+.dask-ClusterRow-backend {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  background: var(--jp-layout-color3, #e0e0e0);
+  color: var(--jp-ui-font-color2);
+}
+
+/* Per-backend colours */
+.dask-ClusterRow-backend--gateway-kubernetes {
+  background: #e3f2fd;
+  color: #1565c0;
+}
+
+.dask-ClusterRow-backend--gateway-htcondor {
+  background: #fce4ec;
+  color: #880e4f;
+}
+
+.dask-ClusterRow-backend--gateway-slurm {
+  background: #f9fbe7;
+  color: #558b2f;
+}
+
+/* ── Panel toolbar ────────────────────────────────────────────────────────── */
+
+.dask-ClusterPanel-toolbar {
+  display: flex;
+  gap: 4px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--jp-border-color2);
+}
+
+.dask-ClusterPanel-newBtn {
+  flex: 1;
+  font-size: var(--jp-ui-font-size1);
+  background: var(--jp-brand-color1);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.dask-ClusterPanel-newBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.dask-ClusterPanel-newBtn:hover:not(:disabled) {
+  background: var(--jp-brand-color0);
+}
+
+.dask-ClusterPanel-refreshBtn {
+  background: transparent;
+  border: 1px solid var(--jp-border-color1);
+  border-radius: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.dask-ClusterPanel-refreshBtn:hover {
+  background: var(--jp-layout-color2);
+}
+
+/* ── Panel states ─────────────────────────────────────────────────────────── */
+
+.dask-ClusterPanel-error {
+  margin: 8px;
+  padding: 8px;
+  background: #ffebee;
+  color: #c62828;
+  border-radius: 4px;
+  font-size: var(--jp-ui-font-size1);
+}
+
+.dask-ClusterPanel-loading {
+  text-align: center;
+  padding: 20px;
+  color: var(--jp-ui-font-color2);
+}
+
+.dask-ClusterPanel-empty {
+  text-align: center;
+  padding: 20px;
+  color: var(--jp-ui-font-color2);
+  font-style: italic;
+}

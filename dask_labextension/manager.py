@@ -1,306 +1,357 @@
-"""A manager for dask clusters."""
+"""
+Dask cluster manager — Dask Gateway–only.
 
-# Copyright (c) Jupyter Development Team.
-# Distributed under the terms of the Modified BSD License.
+All backends route through a Dask Gateway server.  Two client-side patterns:
 
-import asyncio
+  gateway_style "direct"  →  GatewayCluster(address=..., cluster_options=...)
+  gateway_style "factory" →  GatewaySubclass(**kwargs).new_cluster(**method_kwargs)
+
+The server-side backend (Kubernetes, HTCondor, SLURM…) is an admin concern
+and is completely transparent to this module.
+"""
+
+from __future__ import annotations
+
 import importlib
-from inspect import isawaitable
-from typing import Any, Dict, List, Union
-from uuid import uuid4
+import logging
+import uuid
+from typing import Any, Dict, List, Optional
 
 import dask
-from dask.utils import format_bytes
-from dask.distributed import Adaptive
 
-# A type for a dask cluster model: a serializable
-# representation of information about the cluster.
+log = logging.getLogger(__name__)
+
 ClusterModel = Dict[str, Any]
-
-# A type stub for a Dask cluster.
-Cluster = Any
+BackendModel  = Dict[str, str]
 
 
-async def make_cluster(configuration: dict) -> Cluster:
-    module = importlib.import_module(dask.config.get("labextension.factory.module"))
-    Cluster = getattr(module, dask.config.get("labextension.factory.class"))
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
 
-    kwargs = dask.config.get("labextension.factory.kwargs")
-    kwargs = {key.replace("-", "_"): entry for key, entry in kwargs.items()}
+def _labextension_config() -> Dict[str, Any]:
+    return dask.config.get("labextension", default={})
 
-    cluster = await Cluster(
-        *dask.config.get("labextension.factory.args"), **kwargs, asynchronous=True
+
+def get_backends() -> List[BackendModel]:
+    """Return [{id, display_name}, ...] for all configured gateway backends."""
+    cfg = _labextension_config()
+    backends = cfg.get("backends", [])
+    return [
+        {"id": b["id"], "display_name": b.get("display_name", b["id"])}
+        for b in backends
+    ]
+
+
+def _get_backend_config(backend_id: Optional[str] = None) -> Dict[str, Any]:
+    cfg = _labextension_config()
+    backends: List[Dict] = cfg.get("backends", [])
+    if not backends:
+        raise RuntimeError(
+            "No backends configured. Add a 'backends' list to "
+            "~/.config/dask/labextension.yaml"
+        )
+    if backend_id is None:
+        return backends[0]
+    for b in backends:
+        if b["id"] == backend_id:
+            return b
+    raise ValueError(
+        f"Unknown backend '{backend_id}'. "
+        f"Available: {[b['id'] for b in backends]}"
     )
 
-    configuration = dask.config.merge(
-        dask.config.get("labextension.default"), configuration
-    )
 
-    adaptive = None
-    if configuration.get("adapt"):
-        adaptive = cluster.adapt(**configuration.get("adapt"))
-    elif configuration.get("workers") is not None:
-        t = cluster.scale(configuration.get("workers"))
-        if isawaitable(t):
-            await t
+# ---------------------------------------------------------------------------
+# Gateway helpers
+# ---------------------------------------------------------------------------
 
-    return cluster, adaptive
+def _build_cluster_options(opts_dict: Dict[str, Any]) -> Any:
+    """Convert a plain dict to a dask_gateway.ClusterOptions object."""
+    try:
+        from dask_gateway import ClusterOptions  # type: ignore
+        opts = ClusterOptions()
+        for k, v in opts_dict.items():
+            opts[k] = v
+        return opts
+    except ImportError:
+        return opts_dict          # older versions accept plain dicts
 
 
-class DaskClusterManager:
-    """
-    A class for starting, stopping, and otherwise managing the lifecycle
-    of Dask clusters.
-    """
+def _resolve_auth(auth_cfg: Any) -> Any:
+    """Convert an auth sub-dict to the appropriate dask_gateway auth object."""
+    if not isinstance(auth_cfg, dict):
+        return auth_cfg           # already an object or string like "jupyterhub"
+    auth_type   = auth_cfg.pop("type", "jupyterhub").lower()
+    auth_kwargs = auth_cfg.pop("kwargs", {})
+    try:
+        import dask_gateway.auth as gw_auth  # type: ignore
+        classes = {
+            "jupyterhub": "JupyterHubAuth",
+            "kerberos":   "KerberosAuth",
+            "basic":      "BasicAuth",
+        }
+        AuthClass = getattr(gw_auth, classes.get(auth_type, "JupyterHubAuth"))
+        return AuthClass(**auth_kwargs)
+    except (ImportError, AttributeError) as exc:
+        log.warning("Could not resolve auth type '%s': %s", auth_type, exc)
+        return None
 
-    def __init__(self) -> None:
-        """Initialize the cluster manager"""
-        self._clusters: Dict[str, Cluster] = dict()
-        self._adaptives: Dict[str, Adaptive] = dict()
-        self._cluster_names: Dict[str, str] = dict()
-        self._n_clusters = 0
-        self._initialized = None
 
-    async def _async_init(self):
-        """The async part of init
+# ---------------------------------------------------------------------------
+# Cluster creation
+# ---------------------------------------------------------------------------
 
-        Invoked by `await manager`
-        """
-        for model in dask.config.get("labextension.initial"):
-            await self.start_cluster(configuration=model)
-        return self
+def _make_gateway_direct(factory: Dict[str, Any]) -> Any:
+    """GatewayCluster(address=..., cluster_options=ClusterOptions(...))"""
+    module_name: str  = factory.get("module", "dask_gateway")
+    class_name:  str  = factory.get("class", "GatewayCluster")
+    args:        List = list(factory.get("args", []))
+    kwargs:      Dict = dict(factory.get("kwargs", {}))
 
-    @property
-    def initialized(self):
-        """Don't create initialization task until it's been requested
+    # cluster_options dict → ClusterOptions object
+    opts_dict = kwargs.pop("cluster_options", None)
+    if opts_dict:
+        kwargs["cluster_options"] = _build_cluster_options(opts_dict)
 
-        typically via `await manager`
-
-        Makes it easier to ensure we don't do anything before we are in the event loop.
-        """
-        if self._initialized is None:
-            self._initialized = asyncio.create_task(self._async_init())
-        return self._initialized
-
-    async def start_cluster(
-        self, cluster_id: str = "", configuration: dict = {}
-    ) -> ClusterModel:
-        """
-        Start a new Dask cluster.
-
-        Parameters
-        ----------
-        cluster_id : string
-            An optional string id for the cluster. If not given, a random id
-            will be chosen.
-
-        Returns
-        cluster_model : a dask cluster model.
-        """
-        if not cluster_id:
-            cluster_id = str(uuid4())
-
-        cluster, adaptive = await make_cluster(configuration)
-        self._n_clusters += 1
-
-        # Check for a name in the config
-        if not configuration.get("name"):
-            cluster_type = type(cluster).__name__
-            cluster_name = f"{cluster_type} {self._n_clusters}"
+    # auth dict → auth object
+    auth_raw = kwargs.get("auth")
+    if auth_raw is not None:
+        resolved = _resolve_auth(auth_raw)
+        if resolved is None:
+            kwargs.pop("auth", None)
         else:
-            cluster_name = configuration["name"]
+            kwargs["auth"] = resolved
 
-        # Check if the cluster was started adaptively
-        if adaptive:
-            self._adaptives[cluster_id] = adaptive
+    log.info("Gateway-direct: %s.%s", module_name, class_name)
+    mod = importlib.import_module(module_name)
+    return getattr(mod, class_name)(*args, **kwargs)
 
-        self._clusters[cluster_id] = cluster
-        self._cluster_names[cluster_id] = cluster_name
-        return make_cluster_model(cluster_id, cluster_name, cluster, adaptive=adaptive)
 
-    async def close_cluster(self, cluster_id: str) -> Union[ClusterModel, None]:
-        """
-        Close a Dask cluster.
+def _make_gateway_factory(factory: Dict[str, Any]) -> Any:
+    """GatewaySubclass(**kwargs).factory_method(**method_kwargs)
 
-        Parameters
-        ----------
-        cluster_id : string
-            A string id for the cluster.
+    Used by HTCGateway: it is a Gateway connection manager, not a cluster,
+    so cluster = HTCGateway(**kw).new_cluster(**method_kw).
+    """
+    module_name:   str  = factory.get("module", "htcdaskgateway")
+    class_name:    str  = factory.get("class", "HTCGateway")
+    method_name:   str  = factory.get("factory_method", "new_cluster")
+    args:          List = list(factory.get("args", []))
+    kwargs:        Dict = dict(factory.get("kwargs", {}))
+    method_kwargs: Dict = dict(factory.get("method_kwargs", {}))
 
-        Returns
-        cluster_model : the dask cluster model for the shut down cluster,
-            or None if it was not found.
-        """
-        cluster = self._clusters.get(cluster_id)
-        if cluster:
-            r = cluster.close()
-            if isawaitable(r):
-                await r
-            self._clusters.pop(cluster_id)
-            name = self._cluster_names.pop(cluster_id)
-            adaptive = self._adaptives.pop(cluster_id, None)
-            return make_cluster_model(cluster_id, name, cluster, adaptive)
-
+    auth_raw = kwargs.get("auth")
+    if auth_raw is not None:
+        resolved = _resolve_auth(auth_raw)
+        if resolved is None:
+            kwargs.pop("auth", None)
         else:
-            return None
+            kwargs["auth"] = resolved
 
-    async def get_cluster(self, cluster_id) -> Union[ClusterModel, None]:
-        """
-        Get a Dask cluster model.
+    log.info("Gateway-factory: %s.%s(**kw).%s(**mkw)", module_name, class_name, method_name)
+    mod          = importlib.import_module(module_name)
+    gw_instance  = getattr(mod, class_name)(*args, **kwargs)
+    return getattr(gw_instance, method_name)(**method_kwargs)
 
-        Parameters
-        ----------
-        cluster_id : string
-            A string id for the cluster.
 
-        Returns
-        cluster_model : the dask cluster model for the cluster,
-            or None if it was not found.
-        """
-        cluster = self._clusters.get(cluster_id)
-        name = self._cluster_names.get(cluster_id, "")
-        adaptive = self._adaptives.get(cluster_id)
-        if not cluster:
-            return None
+def make_cluster(
+    configuration: Optional[Dict[str, Any]] = None,
+    backend_id: Optional[str] = None,
+) -> Any:
+    """Create and return a GatewayCluster using the configured backend."""
+    if configuration is None:
+        configuration = _get_backend_config(backend_id)
 
-        return make_cluster_model(cluster_id, name, cluster, adaptive)
+    gateway_style: str  = configuration.get("gateway_style", "direct")
+    factory:       Dict = configuration.get("factory", {})
 
-    async def list_clusters(self) -> List[ClusterModel]:
-        """
-        List the Dask cluster models known to the manager.
+    if gateway_style == "factory":
+        return _make_gateway_factory(factory)
+    return _make_gateway_direct(factory)
 
-        Returns
-        cluster_models : A list of the dask cluster models known to the manager.
-        """
-        return [
-            make_cluster_model(
-                cluster_id,
-                self._cluster_names[cluster_id],
-                self._clusters[cluster_id],
-                self._adaptives.get(cluster_id, None),
-            )
-            for cluster_id in self._clusters
-        ]
 
-    async def scale_cluster(self, cluster_id: str, n: int) -> Union[ClusterModel, None]:
-        cluster = self._clusters.get(cluster_id)
-        name = self._cluster_names[cluster_id]
-        adaptive = self._adaptives.pop(cluster_id, None)
-
-        # Check if the cluster exists
-        if not cluster:
-            return None
-
-        # Check if it is actually different.
-        model = make_cluster_model(cluster_id, name, cluster, adaptive)
-        if model.get("adapt") is None and model["workers"] == n:
-            return model
-
-        # Otherwise, rescale the model.
-        t = cluster.scale(n)
-        if isawaitable(t):
-            await t
-        return make_cluster_model(cluster_id, name, cluster, adaptive=None)
-
-    async def adapt_cluster(
-        self, cluster_id: str, minimum: int, maximum: int
-    ) -> Union[ClusterModel, None]:
-        cluster = self._clusters.get(cluster_id)
-        name = self._cluster_names[cluster_id]
-        adaptive = self._adaptives.pop(cluster_id, None)
-
-        # Check if the cluster exists
-        if not cluster:
-            return None
-
-        # Check if it is actually different.
-        model = make_cluster_model(cluster_id, name, cluster, adaptive)
-        if (
-            model.get("adapt") is not None
-            and model["adapt"]["minimum"] == minimum
-            and model["adapt"]["maximum"] == maximum
-        ):
-            return model
-
-        # Otherwise, rescale the model.
-        adaptive = cluster.adapt(minimum=minimum, maximum=maximum)
-        self._adaptives[cluster_id] = adaptive
-        return make_cluster_model(cluster_id, name, cluster, adaptive)
-
-    async def close(self):
-        """Close all clusters and cleanup"""
-        for cluster_id in list(self._clusters):
-            await self.close_cluster(cluster_id)
-
-    async def __aenter__(self):
-        """
-        Enter an asynchronous context.
-        This waits for any initial clusters specified via configuration to start.
-        """
-        await self.initialized
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        """
-        Exit an asynchronous context.
-        This closes any extant clusters.
-        """
-        await self.close()
-
-    def __await__(self):
-        """
-        Awaiter for the manager to be initialized.
-        This waits for any initial clusters specified via configuration to start.
-        """
-        return self.initialized.__await__()
-
+# ---------------------------------------------------------------------------
+# Cluster model
+# ---------------------------------------------------------------------------
 
 def make_cluster_model(
-    cluster_id: str,
+    cluster_id:  str,
     cluster_name: str,
-    cluster: Cluster,
-    adaptive: Union[Adaptive, None],
+    cluster:     Any,
+    adaptive:    Any,
+    backend_id:  Optional[str] = None,
 ) -> ClusterModel:
-    """
-    Make a cluster model. This is a JSON-serializable representation
-    of the information about a cluster that can be sent over the wire.
+    """Build a JSON-serialisable cluster representation for GatewayCluster."""
 
-    Parameters
-    ----------
-    cluster_id: string
-        A unique string for the cluster.
-
-    cluster_name: string
-        A display name for the cluster.
-
-    cluster: Cluster
-        The cluster out of which to make the cluster model.
-
-    adaptive: Adaptive
-        The adaptive controller for the number of workers for the cluster, or
-        none if the cluster is not scaled adaptively.
-    """
-    # This would be a great target for a dataclass
-    # once python 3.7 is in wider use.
+    # Worker info — GatewayCluster.scheduler_info may be unavailable until
+    # workers connect; guard everything.
     try:
         info = cluster.scheduler_info
+        if callable(info):
+            info = {}
     except AttributeError:
-        info = cluster.scheduler.identity()
-    try:
-        cores = sum(d["nthreads"] for d in info["workers"].values())
-    except KeyError:  # dask.__version__ < 2.0
-        cores = sum(d["ncores"] for d in info["workers"].values())
-    assert isinstance(info, dict)
-    model = dict(
-        id=cluster_id,
-        name=cluster_name,
-        scheduler_address=cluster.scheduler_address,
-        dashboard_link=cluster.dashboard_link or "",
-        workers=len(info["workers"]),
-        memory=format_bytes(sum(d["memory_limit"] for d in info["workers"].values())),
-        cores=cores,
-    )
-    if adaptive:
-        model["adapt"] = {"minimum": adaptive.minimum, "maximum": adaptive.maximum}
+        info = {}
 
-    return model
+    workers_info: Dict = info.get("workers", {}) if isinstance(info, dict) else {}
+    cores  = sum(d.get("nthreads",      0) for d in workers_info.values())
+    memory = sum(d.get("memory_limit",  0) for d in workers_info.values())
+
+    # Scheduler address
+    scheduler_address = ""
+    for attr in ("scheduler_address", "scheduler_comm"):
+        val = getattr(cluster, attr, None)
+        if isinstance(val, str) and val:
+            scheduler_address = val
+            break
+        if hasattr(val, "address"):
+            scheduler_address = str(val.address)
+            break
+
+    # Dashboard link — GatewayCluster returns a JupyterHub-relative path,
+    # e.g. /services/dask-gateway/clusters/<name>/status
+    dashboard_link = ""
+    try:
+        dashboard_link = str(cluster.dashboard_link or "")
+    except AttributeError:
+        pass
+
+    adapt_info = None
+    if adaptive is not None:
+        adapt_info = {
+            "minimum": getattr(adaptive, "minimum", None),
+            "maximum": getattr(adaptive, "maximum", None),
+        }
+
+    return {
+        "id":        cluster_id,
+        "name":      cluster_name,
+        "status":    "running",
+        "cores":     cores,
+        "memory":    memory,
+        "workers":   len(workers_info),
+        "scheduler_address": scheduler_address,  # flat — matches IClusterModel
+        "dashboard_link":    dashboard_link,       # flat — matches IClusterModel
+        "adapt":     adapt_info,
+        "backend":   backend_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cluster registry
+# ---------------------------------------------------------------------------
+
+class DaskClusterManager:
+    """Manages multiple GatewayCluster instances across configured backends."""
+
+    def __init__(self) -> None:
+        self._clusters:      Dict[str, Any]           = {}
+        self._cluster_names: Dict[str, str]           = {}
+        self._adaptives:     Dict[str, Any]           = {}
+        self._backend_ids:   Dict[str, Optional[str]] = {}
+
+    def list_backends(self) -> List[BackendModel]:
+        return get_backends()
+
+    def start_cluster(
+        self,
+        cluster_name:  Optional[str]            = None,
+        configuration: Optional[Dict[str, Any]] = None,
+        backend_id:    Optional[str]            = None,
+    ) -> ClusterModel:
+        cluster      = make_cluster(configuration=configuration, backend_id=backend_id)
+        cluster_id   = str(uuid.uuid4())
+        cluster_name = cluster_name or f"Cluster {len(self._clusters) + 1}"
+
+        self._clusters[cluster_id]      = cluster
+        self._cluster_names[cluster_id] = cluster_name
+        self._adaptives[cluster_id]     = None
+        self._backend_ids[cluster_id]   = backend_id
+
+        cfg       = configuration or _get_backend_config(backend_id)
+        default   = cfg.get("default", {})
+        adapt_cfg = default.get("adapt") or {}
+        workers   = default.get("workers")
+
+        if adapt_cfg:
+            try:
+                self._adaptives[cluster_id] = cluster.adapt(
+                    minimum=adapt_cfg.get("minimum", 0),
+                    maximum=adapt_cfg.get("maximum", 10),
+                )
+            except Exception as exc:
+                log.warning("adapt() unavailable: %s", exc)
+        elif workers:
+            try:
+                cluster.scale(workers)
+            except Exception as exc:
+                log.warning("scale() unavailable: %s", exc)
+
+        return make_cluster_model(
+            cluster_id, cluster_name, cluster,
+            self._adaptives[cluster_id], backend_id=backend_id,
+        )
+
+    def close_cluster(self, cluster_id: str) -> Optional[ClusterModel]:
+        cluster = self._clusters.pop(cluster_id, None)
+        if cluster is None:
+            return None
+        model = make_cluster_model(
+            cluster_id,
+            self._cluster_names.pop(cluster_id, ""),
+            cluster,
+            self._adaptives.pop(cluster_id, None),
+            backend_id=self._backend_ids.pop(cluster_id, None),
+        )
+        try:
+            cluster.close()
+        except Exception as exc:
+            log.warning("close() error: %s", exc)
+        return model
+
+    def get_cluster(self, cluster_id: str) -> Optional[ClusterModel]:
+        cluster = self._clusters.get(cluster_id)
+        if cluster is None:
+            return None
+        return make_cluster_model(
+            cluster_id,
+            self._cluster_names[cluster_id],
+            cluster,
+            self._adaptives.get(cluster_id),
+            backend_id=self._backend_ids.get(cluster_id),
+        )
+
+    def list_clusters(self) -> List[ClusterModel]:
+        return [self.get_cluster(cid) for cid in self._clusters]  # type: ignore[misc]
+
+    def scale_cluster(
+        self,
+        cluster_id: str,
+        workers:    Optional[int]            = None,
+        adapt:      Optional[Dict[str, int]] = None,
+    ) -> Optional[ClusterModel]:
+        cluster = self._clusters.get(cluster_id)
+        if cluster is None:
+            return None
+        prev = self._adaptives.get(cluster_id)
+        if prev:
+            try:
+                prev.stop()
+            except Exception:
+                pass
+            self._adaptives[cluster_id] = None
+        if adapt is not None:
+            try:
+                self._adaptives[cluster_id] = cluster.adapt(
+                    minimum=adapt.get("minimum", 0),
+                    maximum=adapt.get("maximum", 10),
+                )
+            except Exception as exc:
+                log.warning("adapt() failed: %s", exc)
+        elif workers is not None:
+            cluster.scale(workers)
+        return self.get_cluster(cluster_id)
+
+    def close_all(self) -> None:
+        for cid in list(self._clusters):
+            self.close_cluster(cid)

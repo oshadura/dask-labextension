@@ -1,20 +1,97 @@
+# Dask JupyterLab Extension — Dask Gateway–only configuration
+#
+# All cluster backends route through a Dask Gateway server.
+# The server backend (Kubernetes, HTCondor, SLURM…) is chosen by the
+# facility admin in dask-gateway-server config — invisible to this file.
+#
+# Two client-side patterns, set via gateway_style:
+#
+#   direct  →  GatewayCluster(address=..., cluster_options=...)
+#              Standard dask-gateway client. Works with any server backend.
+#
+#   factory →  GatewaySubclass(**kwargs).new_cluster(**method_kwargs)
+#              Used by HTCGateway (casa-htcdaskgateway): scheduler on K8s,
+#              workers on HTCondor, client is a Gateway connection manager.
+#
+# Config location:
+#   ~/.config/dask/labextension.yaml   (user override)
+#   /etc/dask/labextension.yaml        (system-wide default)
+# ─────────────────────────────────────────────────────────────────────────────
+
 labextension:
-  factory:
-    module: 'dask.distributed'
-    class: 'LocalCluster'
-    args: []
-    kwargs: {}
-  default:
-    workers: null
-    adapt:
-      null
-      # minimum: 0
-      # maximum: 10
-  initial:
-    []
-    # - name: "My Big Cluster"
-    #   workers: 100
-    # - name: "Adaptive Cluster"
-    #   adapt:
-    #     minimum: 0
-    #     maximum: 50
+
+  backends:
+
+    # ── Gateway → Kubernetes backend ─────────────────────────────────────────
+    # Server: dask_gateway_server.backends.kubernetes
+    # Client: GatewayCluster(address=..., cluster_options=...)
+    - id: "gateway-kubernetes"
+      display_name: "Kubernetes"
+      gateway_style: "direct"
+      factory:
+        module: 'dask_gateway'
+        class: 'GatewayCluster'
+        args: []
+        kwargs:
+          address: "http://api-dask-gateway.dask-gateway:8000"
+          proxy_address: "gateway://api-dask-gateway:8000"
+          public_address: "/services/dask-gateway/"
+          shutdown_on_close: true
+          # cluster_options keys depend on what the gateway admin has exposed:
+          # cluster_options:
+          #   worker_cores: 1
+          #   worker_memory: "2 G"
+          #   image: "ghcr.io/dask/dask:latest"
+          #   environment: "my-conda-env"
+      default:
+        workers: null
+        adapt: null
+        # adapt:
+        #   minimum: 0
+        #   maximum: 20
+
+    # ── Gateway → HTCondor backend (HTCGateway / casa-htcdaskgateway) ─────────
+    # Heterogeneous: scheduler pod on Kubernetes, workers on HTCondor.
+    # Server: custom HTCondor backend  https://github.com/mapsacosta/htcdaskgateway
+    # Client: HTCGateway  (pip install htcdaskgateway)
+    #
+    # Uses factory pattern: HTCGateway(**kwargs).new_cluster(**method_kwargs)
+    - id: "gateway-htcondor"
+      display_name: "HTCondor"
+      gateway_style: "factory"
+      factory:
+        module: 'htcdaskgateway'
+        class: 'HTCGateway'
+        factory_method: 'new_cluster'
+        args: []
+        kwargs:
+          # Passed to HTCGateway() constructor.
+          # Usually auto-detected from JUPYTERHUB_SERVICE_PREFIX /
+          # DASK_GATEWAY__ADDRESS env vars set by JupyterHub.
+          # Uncomment to override:
+          # address: "http://api-dask-gateway.dask-gateway:8000"
+          # proxy_address: "gateway://api-dask-gateway:8000"
+          # public_address: "/services/dask-gateway/"
+        method_kwargs:
+          # Passed to .new_cluster() → become server-side cluster_options.
+          # Available keys depend on what the gateway admin has configured.
+          {}
+          # image: "coffeateam/coffea-dask-cc7-gateway:0.7.12-fastjet-3.3.4.0rc9-g8a990fa"
+          # worker_cores: 1
+          # worker_memory: "2 G"
+          # shutdown_on_close: true
+      default:
+        workers: null
+        adapt: null
+
+  # ── Clusters created automatically at notebook-server startup ────────────
+  initial: []
+  # initial:
+  #   - name: "K8s Adaptive"
+  #     backend: "gateway-kubernetes"
+  #     adapt:
+  #       minimum: 0
+  #       maximum: 20
+  #   - name: "HTCondor 5 workers"
+  #     backend: "gateway-htcondor"
+  #     workers: 5
