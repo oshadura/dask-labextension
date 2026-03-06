@@ -1,16 +1,19 @@
 // src/clusters.tsx
 //
-// Drop-in replacement for the upstream dask-labextension clusters.tsx.
-// Adds multi-backend Dask Gateway support:
-//   1. On panel mount, fetches GET /dask/backends.
-//   2. "New Cluster" opens a dialog to pick a gateway backend.
-//   3. POST /dask/clusters includes { backend: selectedBackendId }.
-//   4. Each cluster row shows a backend badge.
+// Upstream-compatible DaskClusterManager with multi-backend Dask Gateway support.
 //
-// Public API kept identical to upstream:
-//   export interface IClusterModel   (same field names as upstream)
-//   export class DaskClusterManager  (renamed from ClusterPanel)
+// Changes vs upstream:
+//   1. On start(), fetches GET /dask/backends and shows a backend-picker dialog.
+//   2. POST /dask/clusters sends { backend: selectedBackendId }.
+//   3. Each cluster row shows a coloured backend badge.
+//
+// The public class API (constructor signature, all getters/methods) is
+// identical to upstream so that index.ts, sidebar.ts and scaling.tsx
+// compile without changes.
 
+import { IChangedArgs } from '@jupyterlab/coreutils';
+import { URLExt } from '@jupyterlab/coreutils';
+import { ServerConnection } from '@jupyterlab/services';
 import {
   Dialog,
   InputDialog,
@@ -19,27 +22,36 @@ import {
   showErrorMessage
 } from '@jupyterlab/apputils';
 
-import { URLExt } from '@jupyterlab/coreutils';
-import { ServerConnection } from '@jupyterlab/services';
+import { ISignal, Signal } from '@lumino/signaling';
+import { Widget } from '@lumino/widgets';
 
 import * as React from 'react';
+import * as ReactDOM from 'react-dom';
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Public model type — identical field names to upstream ────────────────────
 
 export interface IClusterModel {
+  /** Unique string ID. */
   id: string;
+  /** Display name. */
   name: string;
-  /** Flat scheduler address string — matches upstream field name. */
+  /** Scheduler address URI. */
   scheduler_address: string;
-  /** Flat dashboard URL string — matches upstream field name. */
+  /** Dashboard URL (may be a JupyterHub-proxied path for Gateway clusters). */
   dashboard_link: string;
+  /** Total worker count. */
   workers: number;
+  /** Total core count. */
   cores: number;
+  /** Total memory (bytes). */
   memory: number;
+  /** Adaptive scaling config, or null. */
   adapt: { minimum: number; maximum: number } | null;
-  /** Backend id — extension-specific field, absent in plain upstream. */
+  /** Backend id — extension-specific, not present in plain upstream. */
   backend?: string | null;
 }
+
+// ─── Backend type (extension-specific) ───────────────────────────────────────
 
 interface IBackend {
   id: string;
@@ -48,98 +60,109 @@ interface IBackend {
 
 // ─── Server helpers ───────────────────────────────────────────────────────────
 
-const SERVER_CONNECTION = ServerConnection.makeSettings();
-
-function apiURL(path: string): string {
-  return URLExt.join(SERVER_CONNECTION.baseUrl, 'dask', path);
+function makeSettings(): ServerConnection.ISettings {
+  return ServerConnection.makeSettings();
 }
 
-async function fetchBackends(): Promise<IBackend[]> {
-  const response = await ServerConnection.makeRequest(
-    apiURL('backends'),
+function apiURL(settings: ServerConnection.ISettings, path: string): string {
+  return URLExt.join(settings.baseUrl, 'dask', path);
+}
+
+async function requestBackends(
+  settings: ServerConnection.ISettings
+): Promise<IBackend[]> {
+  const resp = await ServerConnection.makeRequest(
+    apiURL(settings, 'backends'),
     {},
-    SERVER_CONNECTION
+    settings
   );
-  if (!response.ok) {
-    throw new Error(`Failed to fetch backends: ${response.statusText}`);
-  }
-  return response.json();
+  if (!resp.ok) return [];
+  return resp.json();
 }
 
-async function createCluster(
-  backendId: string | null,
-  name: string | null
+async function requestCreateCluster(
+  settings: ServerConnection.ISettings,
+  backendId: string | null
 ): Promise<IClusterModel> {
   const body: Record<string, string> = {};
   if (backendId) body.backend = backendId;
-  if (name) body.name = name;
-
-  const response = await ServerConnection.makeRequest(
-    apiURL('clusters'),
+  const resp = await ServerConnection.makeRequest(
+    apiURL(settings, 'clusters'),
     {
       method: 'POST',
       body: JSON.stringify(body),
       headers: { 'Content-Type': 'application/json' }
     },
-    SERVER_CONNECTION
+    settings
   );
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Failed to create cluster: ${text}`);
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error(`Failed to start Dask cluster: ${txt}`);
   }
-  return response.json();
+  return resp.json();
 }
 
-async function fetchClusters(): Promise<IClusterModel[]> {
-  const response = await ServerConnection.makeRequest(
-    apiURL('clusters'),
+async function requestListClusters(
+  settings: ServerConnection.ISettings
+): Promise<IClusterModel[]> {
+  const resp = await ServerConnection.makeRequest(
+    apiURL(settings, 'clusters'),
     {},
-    SERVER_CONNECTION
+    settings
   );
-  if (!response.ok) {
-    throw new Error('Failed to list clusters');
+  if (!resp.ok) {
+    throw new Error(
+      'Failed to list clusters: might the server extension not be installed/enabled?'
+    );
   }
-  return response.json();
+  return resp.json();
 }
 
-async function deleteCluster(clusterId: string): Promise<void> {
+async function requestDeleteCluster(
+  settings: ServerConnection.ISettings,
+  id: string
+): Promise<void> {
   await ServerConnection.makeRequest(
-    apiURL(`clusters/${clusterId}`),
+    apiURL(settings, `clusters/${id}`),
     { method: 'DELETE' },
-    SERVER_CONNECTION
+    settings
   );
 }
 
-async function scaleCluster(
-  clusterId: string,
+async function requestScaleCluster(
+  settings: ServerConnection.ISettings,
+  id: string,
   workers?: number,
   adapt?: { minimum: number; maximum: number }
 ): Promise<IClusterModel> {
   const body: Record<string, unknown> = {};
   if (workers !== undefined) body.workers = workers;
   if (adapt !== undefined) body.adapt = adapt;
-
-  const response = await ServerConnection.makeRequest(
-    apiURL(`clusters/${clusterId}`),
+  const resp = await ServerConnection.makeRequest(
+    apiURL(settings, `clusters/${id}`),
     {
       method: 'PATCH',
       body: JSON.stringify(body),
       headers: { 'Content-Type': 'application/json' }
     },
-    SERVER_CONNECTION
+    settings
   );
-  return response.json();
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error(`Failed to scale cluster: ${txt}`);
+  }
+  return resp.json();
 }
 
-// ─── Backend selector dialog ──────────────────────────────────────────────────
+// ─── Backend-picker dialog ────────────────────────────────────────────────────
 
-interface IBackendDialogBodyProps {
+interface IBackendBodyProps {
   backends: IBackend[];
   selectedId: string;
   onChange: (id: string) => void;
 }
 
-class BackendDialogBody extends React.Component<IBackendDialogBodyProps> {
+class BackendDialogBody extends React.Component<IBackendBodyProps> {
   render() {
     const { backends, selectedId, onChange } = this.props;
     return (
@@ -206,28 +229,33 @@ async function showBackendDialog(
   return result.button.accept ? selected : null;
 }
 
-// ─── Cluster row component ────────────────────────────────────────────────────
+// ─── React UI components ──────────────────────────────────────────────────────
 
 interface IClusterRowProps {
   model: IClusterModel;
   backends: IBackend[];
-  onDelete: (id: string) => void;
+  isActive: boolean;
+  onSelect: (id: string) => void;
+  onStop: (id: string) => void;
   onScale: (id: string) => void;
   onInjectClient: (model: IClusterModel) => void;
 }
 
 function backendLabel(model: IClusterModel, backends: IBackend[]): string {
   if (!model.backend) return '';
-  const b = backends.find(x => x.id === model.backend);
-  return b ? b.display_name : model.backend;
+  const found = backends.find(b => b.id === model.backend);
+  return found ? found.display_name : model.backend;
 }
 
 function ClusterRow(props: IClusterRowProps) {
-  const { model, backends, onDelete, onScale, onInjectClient } = props;
+  const { model, backends, isActive, onSelect, onStop, onScale, onInjectClient } = props;
   const label = backendLabel(model, backends);
 
   return (
-    <div className="dask-ClusterRow">
+    <div
+      className={`dask-ClusterRow${isActive ? ' dask-ClusterRow--active' : ''}`}
+      onClick={() => onSelect(model.id)}
+    >
       <div className="dask-ClusterRow-title">
         <span className="dask-ClusterRow-name">{model.name}</span>
         {label && (
@@ -240,28 +268,27 @@ function ClusterRow(props: IClusterRowProps) {
         )}
       </div>
       <div className="dask-ClusterRow-stats">
-        <span>{model.workers} workers</span>
-        <span>{model.cores} cores</span>
+        <span>{model.workers} workers · {model.cores} cores</span>
       </div>
       <div className="dask-ClusterRow-buttons">
         <button
           className="dask-ClusterRow-btn"
-          title="Inject client code"
-          onClick={() => onInjectClient(model)}
+          title="Inject Dask Client Connection Code"
+          onClick={e => { e.stopPropagation(); onInjectClient(model); }}
         >
           {'</>'}
         </button>
         <button
           className="dask-ClusterRow-btn"
-          title="Scale cluster"
-          onClick={() => onScale(model.id)}
+          title="Scale Cluster"
+          onClick={e => { e.stopPropagation(); onScale(model.id); }}
         >
           ⚙
         </button>
         <button
-          className="dask-ClusterRow-btn dask-ClusterRow-btn--delete"
-          title="Shut down cluster"
-          onClick={() => onDelete(model.id)}
+          className="dask-ClusterRow-btn dask-ClusterRow-btn--stop"
+          title="Shut Down Cluster"
+          onClick={e => { e.stopPropagation(); onStop(model.id); }}
         >
           ✕
         </button>
@@ -270,216 +297,279 @@ function ClusterRow(props: IClusterRowProps) {
   );
 }
 
-// ─── Main cluster panel ───────────────────────────────────────────────────────
-
-interface IDaskClusterManagerState {
+interface IClusterPanelProps {
   clusters: IClusterModel[];
   backends: IBackend[];
-  loading: boolean;
-  error: string | null;
+  activeClusterId: string | undefined;
+  isReady: boolean;
+  onNewCluster: () => void;
+  onStopCluster: (id: string) => void;
+  onScaleCluster: (id: string) => void;
+  onSelectCluster: (id: string) => void;
+  onInjectClient: (model: IClusterModel) => void;
 }
 
-/**
- * Main cluster management panel.
- * Exported as DaskClusterManager to match the name expected by index.ts,
- * sidebar.ts, and any other upstream consumers.
- */
-export class DaskClusterManager extends ReactWidget {
-  private _state: IDaskClusterManagerState = {
-    clusters: [],
-    backends: [],
-    loading: false,
-    error: null
-  };
-  private _pollInterval: ReturnType<typeof setInterval> | null = null;
+function ClusterPanel(props: IClusterPanelProps) {
+  const {
+    clusters, backends, activeClusterId, isReady,
+    onNewCluster, onStopCluster, onScaleCluster, onSelectCluster, onInjectClient
+  } = props;
 
-  constructor() {
+  return (
+    <div className="dask-DaskClusterManager-content">
+      <div className="dask-ClusterPanel-toolbar">
+        <button
+          className="dask-ClusterPanel-newBtn"
+          disabled={!isReady}
+          onClick={onNewCluster}
+        >
+          + New Cluster
+        </button>
+      </div>
+      {clusters.length === 0 && isReady && (
+        <div className="dask-ClusterPanel-empty">
+          No clusters. Click "+ New Cluster" to start one.
+        </div>
+      )}
+      {!isReady && (
+        <div className="dask-ClusterPanel-loading">Connecting…</div>
+      )}
+      {clusters.map(model => (
+        <ClusterRow
+          key={model.id}
+          model={model}
+          backends={backends}
+          isActive={model.id === activeClusterId}
+          onSelect={onSelectCluster}
+          onStop={onStopCluster}
+          onScale={onScaleCluster}
+          onInjectClient={onInjectClient}
+        />
+      ))}
+    </div>
+  );
+}
+
+// ─── DaskClusterManager ───────────────────────────────────────────────────────
+//
+// Extends Widget (not ReactWidget) to match the upstream class contract.
+// React rendering is done manually via ReactDOM.render in onUpdateRequest.
+
+export class DaskClusterManager extends Widget {
+  constructor(options: DaskClusterManager.IOptions) {
     super();
     this.addClass('dask-DaskClusterManager');
-    this.title.label = 'Dask Clusters';
-    this.title.iconClass = 'dask-DaskLogo';
+    this._settings = makeSettings();
+    this._injectClientCodeForCluster = options.injectClientCodeForCluster;
+    this._getClientCodeForCluster    = options.getClientCodeForCluster;
+    // Store any extra options the upstream passes (launchClusterId etc.)
+    this._launchClusterId = options.launchClusterId;
   }
 
+  // ── Public API — identical to upstream ─────────────────────────────────────
+
+  get activeCluster(): IClusterModel | undefined {
+    return this._clusters.find(c => c.id === this._activeClusterId);
+  }
+
+  get activeClusterChanged(): ISignal<
+    this,
+    IChangedArgs<IClusterModel | undefined>
+  > {
+    return this._activeClusterChanged;
+  }
+
+  get isReady(): boolean {
+    return this._isReady;
+  }
+
+  get clusters(): IClusterModel[] {
+    return this._clusters;
+  }
+
+  setActiveCluster(id: string): void {
+    this._setActiveById(id);
+  }
+
+  async refresh(): Promise<void> {
+    await this._updateClusterList();
+  }
+
+  /** Start a new cluster. Shows backend dialog if >1 backend configured. */
+  async start(): Promise<IClusterModel> {
+    return this._launchCluster();
+  }
+
+  async stop(id: string): Promise<void> {
+    if (!this._clusters.find(c => c.id === id)) {
+      throw new Error(`Cannot find cluster ${id}`);
+    }
+    await this._stopById(id);
+  }
+
+  async scale(id: string): Promise<IClusterModel> {
+    const cluster = this._clusters.find(c => c.id === id);
+    if (!cluster) {
+      throw new Error(`Cannot find cluster ${id}`);
+    }
+    return this._scaleById(id);
+  }
+
+  // ── Lifecycle ───────────────────────────────────────────────────────────────
+
   protected onAfterAttach(): void {
-    this._initialize();
-    this._pollInterval = setInterval(() => this._refreshClusters(), 5000);
+    this._updateClusterList().then(() => {
+      this._isReady = true;
+      this._render();
+    });
+    this._pollHandle = setInterval(() => this._updateClusterList(), 5000);
   }
 
   protected onBeforeDetach(): void {
-    if (this._pollInterval !== null) {
-      clearInterval(this._pollInterval);
+    if (this._pollHandle !== null) {
+      clearInterval(this._pollHandle);
     }
+    ReactDOM.unmountComponentAtNode(this.node);
   }
 
-  private async _initialize(): Promise<void> {
-    this._setState({ loading: true, error: null });
+  protected onUpdateRequest(): void {
+    this._render();
+  }
+
+  // ── Private ─────────────────────────────────────────────────────────────────
+
+  private _render(): void {
+    ReactDOM.render(
+      <ClusterPanel
+        clusters={this._clusters}
+        backends={this._backends}
+        activeClusterId={this._activeClusterId}
+        isReady={this._isReady}
+        onNewCluster={() => void this._launchCluster()}
+        onStopCluster={id => void this._stopById(id)}
+        onScaleCluster={id => void this._scaleById(id)}
+        onSelectCluster={id => this._setActiveById(id)}
+        onInjectClient={model => this._injectClientCodeForCluster(model)}
+      />,
+      this.node
+    );
+  }
+
+  private async _updateClusterList(): Promise<void> {
+    // Fetch backends on first call
+    if (this._backends.length === 0) {
+      try {
+        this._backends = await requestBackends(this._settings);
+      } catch {
+        // non-fatal: backends endpoint may not exist in older setups
+      }
+    }
     try {
-      const [backends, clusters] = await Promise.all([
-        fetchBackends(),
-        fetchClusters()
-      ]);
-      this._setState({ backends, clusters, loading: false });
+      this._clusters = await requestListClusters(this._settings);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      this._setState({ loading: false, error: msg });
+      void showErrorMessage('Dask Server Error', msg);
     }
-  }
-
-  private async _refreshClusters(): Promise<void> {
-    try {
-      const clusters = await fetchClusters();
-      this._setState({ clusters });
-    } catch {
-      // silently ignore poll errors
-    }
-  }
-
-  private _setState(patch: Partial<IDaskClusterManagerState>): void {
-    this._state = { ...this._state, ...patch };
     this.update();
   }
 
-  // ── Public actions (callable from index.ts toolbar commands) ─────────────
-
-  async newCluster(): Promise<void> {
-    const { backends } = this._state;
-    if (backends.length === 0) {
-      void showErrorMessage('No backends', 'No gateway backends are configured.');
-      return;
+  private async _launchCluster(): Promise<IClusterModel> {
+    // Ensure backends are loaded
+    if (this._backends.length === 0) {
+      try {
+        this._backends = await requestBackends(this._settings);
+      } catch {
+        // ignore — will create with no backend specified
+      }
     }
 
-    const backendId = await showBackendDialog(backends);
-    if (backendId === null) return;
-
-    this._setState({ loading: true, error: null });
-    try {
-      const model = await createCluster(backendId, null);
-      this._setState({
-        clusters: [...this._state.clusters, model],
-        loading: false
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this._setState({ loading: false, error: msg });
+    let backendId: string | null = null;
+    if (this._backends.length > 0) {
+      backendId = await showBackendDialog(this._backends);
+      if (backendId === null) {
+        // User cancelled dialog
+        throw new Error('Cluster creation cancelled');
+      }
     }
+
+    const cluster = await requestCreateCluster(this._settings, backendId);
+    this._clusters = [...this._clusters, cluster];
+    this._setActiveById(cluster.id);
+    this.update();
+    return cluster;
   }
 
-  private async _deleteCluster(clusterId: string): Promise<void> {
-    try {
-      await deleteCluster(clusterId);
-      this._setState({
-        clusters: this._state.clusters.filter(c => c.id !== clusterId)
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      void showErrorMessage('Delete failed', msg);
+  private async _stopById(id: string): Promise<void> {
+    await requestDeleteCluster(this._settings, id);
+    this._clusters = this._clusters.filter(c => c.id !== id);
+    if (this._activeClusterId === id) {
+      const next = this._clusters[0];
+      this._setActiveById(next ? next.id : '');
     }
+    this.update();
   }
 
-  private async _scaleCluster(clusterId: string): Promise<void> {
+  private async _scaleById(id: string): Promise<IClusterModel> {
     const result = await InputDialog.getNumber({
-      title: 'Scale cluster',
+      title: 'Scale Dask Cluster',
       label: 'Number of workers',
       value: 1
     });
-    if (!result.button.accept || result.value === null) return;
-    try {
-      const updated = await scaleCluster(clusterId, result.value);
-      this._setState({
-        clusters: this._state.clusters.map(c =>
-          c.id === clusterId ? updated : c
-        )
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      void showErrorMessage('Scale failed', msg);
+    if (!result.button.accept || result.value === null) {
+      return this._clusters.find(c => c.id === id)!;
     }
+    const updated = await requestScaleCluster(this._settings, id, result.value);
+    this._clusters = this._clusters.map(c => c.id === id ? updated : c);
+    this.update();
+    return updated;
   }
 
-  private _injectClientCode(model: IClusterModel): void {
-    this._injectRequested.emit(model);
+  private _setActiveById(id: string): void {
+    const oldCluster = this.activeCluster;
+    this._activeClusterId = id;
+    const newCluster = this.activeCluster;
+    this._activeClusterChanged.emit({
+      name: 'activeCluster',
+      oldValue: oldCluster,
+      newValue: newCluster
+    });
+    // Notify index.ts via the injected callback when selection changes
+    if (newCluster && this._getClientCodeForCluster) {
+      // index.ts watches activeClusterChanged — no direct call needed here
+    }
+    this.update();
   }
 
-  // Signal exposed to index.ts for kernel client injection
-  private _injectRequested = new Private.Signal<IClusterModel>(this);
-  get injectRequested() {
-    return this._injectRequested;
-  }
+  // ── Private state ────────────────────────────────────────────────────────────
 
-  // ── Render ───────────────────────────────────────────────────────────────
+  private _settings:                   ServerConnection.ISettings;
+  private _clusters:                   IClusterModel[] = [];
+  private _backends:                   IBackend[]       = [];
+  private _activeClusterId:            string | undefined;
+  private _isReady:                    boolean          = false;
+  private _pollHandle:                 ReturnType<typeof setInterval> | null = null;
+  private _launchClusterId:            string | undefined;
 
-  render() {
-    const { clusters, backends, loading, error } = this._state;
+  private readonly _injectClientCodeForCluster: (model: IClusterModel) => Promise<void>;
+  private readonly _getClientCodeForCluster:    (model: IClusterModel) => string;
 
-    return (
-      <div className="dask-DaskClusterManager-content">
-        <div className="dask-ClusterPanel-toolbar">
-          <button
-            className="dask-ClusterPanel-newBtn"
-            title="New Cluster"
-            disabled={loading}
-            onClick={() => void this.newCluster()}
-          >
-            + New Cluster
-          </button>
-          <button
-            className="dask-ClusterPanel-refreshBtn"
-            title="Refresh"
-            onClick={() => void this._refreshClusters()}
-          >
-            ↻
-          </button>
-        </div>
-
-        {error && (
-          <div className="dask-ClusterPanel-error">⚠ {error}</div>
-        )}
-
-        {loading && (
-          <div className="dask-ClusterPanel-loading">Loading…</div>
-        )}
-
-        {!loading && clusters.length === 0 && !error && (
-          <div className="dask-ClusterPanel-empty">
-            No clusters. Click "+ New Cluster" to start one.
-          </div>
-        )}
-
-        {clusters.map(model => (
-          <ClusterRow
-            key={model.id}
-            model={model}
-            backends={backends}
-            onDelete={id => void this._deleteCluster(id)}
-            onScale={id => void this._scaleCluster(id)}
-            onInjectClient={m => this._injectClientCode(m)}
-          />
-        ))}
-      </div>
-    );
-  }
+  private readonly _activeClusterChanged = new Signal<
+    this,
+    IChangedArgs<IClusterModel | undefined>
+  >(this);
 }
 
-// ─── Private Signal shim ──────────────────────────────────────────────────────
+// ─── Options namespace — mirrors upstream ─────────────────────────────────────
 
-namespace Private {
-  type Listener<T> = (sender: unknown, args: T) => void;
-
-  export class Signal<T> {
-    private _listeners: Listener<T>[] = [];
-
-    constructor(private _sender: unknown) {}
-
-    connect(listener: Listener<T>): void {
-      this._listeners.push(listener);
-    }
-
-    disconnect(listener: Listener<T>): void {
-      this._listeners = this._listeners.filter(l => l !== listener);
-    }
-
-    emit(args: T): void {
-      for (const l of this._listeners) l(this._sender, args);
-    }
+export namespace DaskClusterManager {
+  export interface IOptions {
+    /** Callback to inject client connection code into the active notebook. */
+    injectClientCodeForCluster: (model: IClusterModel) => Promise<void>;
+    /** Returns the Python client code string for a cluster model. */
+    getClientCodeForCluster: (model: IClusterModel) => string;
+    /** JupyterLab command registry (passed through but not used directly). */
+    registry?: unknown;
+    /** Optional ID of a cluster to auto-activate on startup. */
+    launchClusterId?: string;
   }
 }
