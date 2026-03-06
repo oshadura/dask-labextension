@@ -362,6 +362,7 @@ export class DaskClusterManager extends Widget {
     this._settings = makeSettings();
     this._injectClientCodeForCluster = options.injectClientCodeForCluster;
     this._getClientCodeForCluster    = options.getClientCodeForCluster;
+    this._setDashboardUrl            = options.setDashboardUrl;
     // Store any extra options the upstream passes (launchClusterId etc.)
 
   }
@@ -533,9 +534,9 @@ export class DaskClusterManager extends Widget {
       oldValue: oldCluster,
       newValue: newCluster
     });
-    // Notify index.ts via the injected callback when selection changes
-    if (newCluster && this._getClientCodeForCluster) {
-      // index.ts watches activeClusterChanged — no direct call needed here
+    // Update the dashboard URL bar whenever the active cluster changes
+    if (newCluster) {
+      this._setDashboardUrl(newCluster.dashboard_link);
     }
     this.update();
   }
@@ -551,6 +552,7 @@ export class DaskClusterManager extends Widget {
 
   private readonly _injectClientCodeForCluster: (model: IClusterModel) => void | Promise<void>;
   private readonly _getClientCodeForCluster:    (model: IClusterModel) => string;
+  private readonly _setDashboardUrl:            (url: string) => void;
 
   private readonly _activeClusterChanged = new Signal<
     this,
@@ -564,6 +566,8 @@ export namespace DaskClusterManager {
   export interface IOptions {
     /** Callback to inject client connection code into the active notebook. */
     injectClientCodeForCluster: (model: IClusterModel) => void | Promise<void>;
+    /** Callback to set the dashboard URL in the sidebar URL input. */
+    setDashboardUrl: (url: string) => void;
     /** Returns the Python client code string for a cluster model. */
     getClientCodeForCluster: (model: IClusterModel) => string;
     /** JupyterLab command registry (passed through). */
