@@ -361,7 +361,6 @@ export class DaskClusterManager extends Widget {
     this.addClass('dask-DaskClusterManager');
     this._settings = makeSettings();
     this._injectClientCodeForCluster = options.injectClientCodeForCluster;
-    this._getClientCodeForCluster    = options.getClientCodeForCluster;
     this._setDashboardUrl            = options.setDashboardUrl;
     // Store any extra options the upstream passes (launchClusterId etc.)
 
@@ -551,7 +550,6 @@ export class DaskClusterManager extends Widget {
   private _pollHandle:                 ReturnType<typeof setInterval> | null = null;
 
   private readonly _injectClientCodeForCluster: (model: IClusterModel) => void | Promise<void>;
-  private readonly _getClientCodeForCluster:    (model: IClusterModel) => string;
   private readonly _setDashboardUrl:            (url: string) => void;
 
   private readonly _activeClusterChanged = new Signal<
