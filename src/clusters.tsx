@@ -363,7 +363,7 @@ export class DaskClusterManager extends Widget {
     this._injectClientCodeForCluster = options.injectClientCodeForCluster;
     this._getClientCodeForCluster    = options.getClientCodeForCluster;
     // Store any extra options the upstream passes (launchClusterId etc.)
-    this._launchClusterId = options.launchClusterId;
+
   }
 
   // ── Public API — identical to upstream ─────────────────────────────────────
@@ -548,9 +548,8 @@ export class DaskClusterManager extends Widget {
   private _activeClusterId:            string | undefined;
   private _isReady:                    boolean          = false;
   private _pollHandle:                 ReturnType<typeof setInterval> | null = null;
-  private _launchClusterId:            string | undefined;
 
-  private readonly _injectClientCodeForCluster: (model: IClusterModel) => Promise<void>;
+  private readonly _injectClientCodeForCluster: (model: IClusterModel) => void | Promise<void>;
   private readonly _getClientCodeForCluster:    (model: IClusterModel) => string;
 
   private readonly _activeClusterChanged = new Signal<
@@ -564,12 +563,12 @@ export class DaskClusterManager extends Widget {
 export namespace DaskClusterManager {
   export interface IOptions {
     /** Callback to inject client connection code into the active notebook. */
-    injectClientCodeForCluster: (model: IClusterModel) => Promise<void>;
+    injectClientCodeForCluster: (model: IClusterModel) => void | Promise<void>;
     /** Returns the Python client code string for a cluster model. */
     getClientCodeForCluster: (model: IClusterModel) => string;
-    /** JupyterLab command registry (passed through but not used directly). */
+    /** JupyterLab command registry (passed through). */
     registry?: unknown;
-    /** Optional ID of a cluster to auto-activate on startup. */
+    /** Optional cluster ID to auto-activate on startup (accepted, not used). */
     launchClusterId?: string;
   }
 }
