@@ -31,3 +31,6 @@ class BackendHandler(JupyterHandler):
     def get(self) -> None:
         backends = self.cluster_manager.list_backends()
         self.finish(json.dumps(backends))
+
+# Alias for any code that references the upstream-style name
+DaskBackendHandler = BackendHandler

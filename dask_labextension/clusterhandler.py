@@ -114,3 +114,6 @@ class ClusterHandler(JupyterHandler):
 
         self.set_status(204)
         self.finish()
+
+# Alias expected by upstream __init__.py
+DaskClusterHandler = ClusterHandler
